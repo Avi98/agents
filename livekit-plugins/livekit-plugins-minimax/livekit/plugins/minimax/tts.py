@@ -25,6 +25,8 @@ from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from .log import logger
 
 TTSModel = Literal[
+    "speech-2.8-hd",
+    "speech-2.8-turbo",
     "speech-2.6-hd",
     "speech-2.6-turbo",
     "speech-2.5-hd-preview",
@@ -163,6 +165,29 @@ class _TTSOptions:
     audio_format: TTSAudioFormat
 
 
+def _validate_options(
+    *,
+    model: TTSModel | str,
+    emotion: TTSEmotion | None,
+    speed: float,
+    intensity: int | None,
+    timbre: int | None,
+) -> None:
+    if not (0.5 <= speed <= 2.0):
+        raise ValueError(f"speed must be between 0.5 and 2.0, but got {speed}")
+    if intensity is not None and not (-100 <= intensity <= 100):
+        raise ValueError(f"intensity must be between -100 and 100, but got {intensity}")
+    if timbre is not None and not (-100 <= timbre <= 100):
+        raise ValueError(f"timbre must be between -100 and 100, but got {timbre}")
+
+    # Validate fluent emotion is only used with speech-2.6-* models
+    if emotion == "fluent" and not model.startswith("speech-2.6"):
+        raise ValueError(
+            f'"fluent" emotion is only supported by speech-2.6-* models, '
+            f'but got model "{model}". Please use speech-2.6-hd or speech-2.6-turbo.'
+        )
+
+
 class TTS(tts.TTS):
     def __init__(
         self,
@@ -191,8 +216,9 @@ class TTS(tts.TTS):
 
         Args:
             model (TTSModel | str, optional): The Minimax TTS model to use. Defaults to DEFAULT_MODEL.
-                Available models: speech-2.6-hd, speech-2.6-turbo, speech-2.5-hd-preview,
-                speech-2.5-turbo-preview, speech-02-hd, speech-02-turbo, speech-01-hd, speech-01-turbo.
+                Available models: speech-2.8-hd, speech-2.8-turbo, speech-2.6-hd, speech-2.6-turbo,
+                speech-2.5-hd-preview, speech-2.5-turbo-preview, speech-02-hd, speech-02-turbo,
+                speech-01-hd, speech-01-turbo.
             voice (TTSVoice | str, optional): The voice to use. Defaults to DEFAULT_VOICE_ID.
             emotion (TTSEmotion | None, optional): Emotion control for speech synthesis.
                 Options: "happy", "sad", "angry", "fearful", "disgusted", "surprised", "neutral", "fluent".
@@ -209,7 +235,7 @@ class TTS(tts.TTS):
             timbre (int | None, optional): Corresponds to the "Nasal/Crisp" slider on the official page. Range: [-100, 100].
             sample_rate (TTSSampleRate, optional): The audio sample rate in Hz. Defaults to 24000.
             bitrate (TTSBitRate, optional): The audio bitrate in kbps. Defaults to 128000.
-            tokenizer (NotGivenOr[tokenize.SentenceTokenizer], optional): The sentence tokenizer to use. Defaults to `livekit.agents.tokenize.basic.SentenceTokenizer`.
+            tokenizer (NotGivenOr[tokenize.SentenceTokenizer], optional): The sentence tokenizer to use. Defaults to `livekit.agents.tokenize.blingfire.SentenceTokenizer`.
             text_pacing (tts.SentenceStreamPacer | bool, optional): Enable text pacing for sentence-level timing control. Defaults to False.
             api_key (str | None, optional): The Minimax API key. Defaults to None.
             base_url (NotGivenOr[str], optional): The base URL for the Minimax API. Defaults to NOT_GIVEN.
@@ -234,22 +260,12 @@ class TTS(tts.TTS):
                 " MINIMAX_API_KEY environment variable"
             )
 
-        if not (0.5 <= speed <= 2.0):
-            raise ValueError(f"speed must be between 0.5 and 2.0, but got {speed}")
-        if intensity is not None and not (-100 <= intensity <= 100):
-            raise ValueError(f"intensity must be between -100 and 100, but got {intensity}")
-        if timbre is not None and not (-100 <= timbre <= 100):
-            raise ValueError(f"timbre must be between -100 and 100, but got {timbre}")
-
-        # Validate fluent emotion is only used with speech-2.6-* models
-        if emotion == "fluent" and not model.startswith("speech-2.6"):
-            raise ValueError(
-                f'"fluent" emotion is only supported by speech-2.6-* models, '
-                f'but got model "{model}". Please use speech-2.6-hd or speech-2.6-turbo.'
-            )
+        _validate_options(
+            model=model, emotion=emotion, speed=speed, intensity=intensity, timbre=timbre
+        )
 
         self._sentence_tokenizer = (
-            tokenizer if utils.is_given(tokenizer) else tokenize.basic.SentenceTokenizer()
+            tokenizer if utils.is_given(tokenizer) else tokenize.blingfire.SentenceTokenizer()
         )
 
         self._stream_pacer: tts.SentenceStreamPacer | None = None
@@ -305,6 +321,16 @@ class TTS(tts.TTS):
         language_boost: NotGivenOr[TTSLanguageBoost | None] = NOT_GIVEN,
     ) -> None:
         """Update the TTS configuration options."""
+        # check the resulting options before changing any of them, so a rejected update
+        # leaves the current configuration in place
+        _validate_options(
+            model=model if utils.is_given(model) else self._opts.model,
+            emotion=emotion if utils.is_given(emotion) else self._opts.emotion,
+            speed=speed if utils.is_given(speed) else self._opts.speed,
+            intensity=intensity if utils.is_given(intensity) else self._opts.intensity,
+            timbre=timbre if utils.is_given(timbre) else self._opts.timbre,
+        )
+
         if utils.is_given(model):
             self._opts.model = model
 
@@ -480,7 +506,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
                     logger.error(
                         f"MiniMax WebSocket error: code={status_code}, msg={status_msg}, trace_id={error_trace_id}",
-                        extra={"request_id": request_id, "full_response": data},
+                        extra={"request_id": request_id, "lk.pii.full_response": data},
                     )
 
                     raise APIStatusError(
@@ -513,14 +539,12 @@ class SynthesizeStream(tts.SynthesizeStream):
                     break
 
                 elif data.get("event") == "task_failed":
-                    error_msg = (
-                        f"MiniMax returned task failed (trace_id: {current_trace_id}): {msg.data}"
-                    )
-                    logger.error(error_msg)
+                    error_msg = f"MiniMax returned task failed (trace_id: {current_trace_id})"
+                    logger.error(error_msg, extra={"lk.pii.data": msg.data})
                     raise APIError(error_msg)
 
                 else:
-                    logger.warning(f"unexpected Minimax message: {msg.data}")
+                    logger.warning("unexpected Minimax message", extra={"lk.pii.data": msg.data})
 
         try:
             ws = await self._tts._connect_ws(self._conn_options.timeout)
@@ -630,7 +654,7 @@ class ChunkedStream(tts.ChunkedStream):
                     if not line:
                         continue
                     if not line.startswith("data:"):
-                        logger.warning("unexpected Minimax message: %s", line)
+                        logger.warning("unexpected Minimax message", extra={"lk.pii.data": line})
                         continue
 
                     data = json.loads(line[5:])
@@ -652,7 +676,7 @@ class ChunkedStream(tts.ChunkedStream):
 
                             logger.error(
                                 f"MiniMax HTTP stream error: code={status_code}, msg={status_msg}, trace_id={error_trace_id}",
-                                extra={"full_response": data},
+                                extra={"lk.pii.full_response": data},
                             )
 
                             raise APIStatusError(

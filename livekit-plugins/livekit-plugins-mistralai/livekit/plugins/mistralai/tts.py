@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import struct
@@ -7,7 +8,7 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Literal
 
-import httpx
+import httpx  # mistralai raises httpx.TimeoutException from its httpx v1 client
 
 from livekit.agents import (
     APIConnectionError,
@@ -19,7 +20,7 @@ from livekit.agents import (
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
 from mistralai.client import Mistral
-from mistralai.client.errors import SDKError
+from mistralai.client.errors import HTTPValidationError, SDKError
 
 from .models import TTSModels, TTSVoices
 
@@ -37,7 +38,7 @@ SAMPLE_RATE: int = 24000
 NUM_CHANNELS: int = 1
 
 RESPONSE_FORMAT = Literal["mp3", "wav", "pcm", "opus", "flac"]
-DEFAULT_RESPONSE_FORMAT: RESPONSE_FORMAT = "pcm"
+DEFAULT_RESPONSE_FORMAT: RESPONSE_FORMAT = "mp3"
 
 
 @dataclass
@@ -67,29 +68,23 @@ class TTS(tts.TTS):
             model: The Mistral AI model to use for text-to-speech, default is "voxtral-mini-tts-latest".
             voice: The voice ID to use for synthesis. Mutually exclusive with ``ref_audio``. Defaults to ``en_paul_neutral`` when neither is given.
             ref_audio: Base64-encoded audio sample (3–25 s) for zero-shot voice cloning. Mutually exclusive with ``voice``.
-            response_format: The audio format of synthesized speech, between ``mp3``, ``wav``, ``pcm``, ``opus`` or ``flac``. Defaults to ``pcm``.
+            response_format: The audio format of synthesized speech, between ``mp3``, ``wav``, ``pcm``, ``opus`` or ``flac``. Defaults to ``mp3``.
         """
         if is_given(voice) and is_given(ref_audio):
             raise ValueError("Only one of 'voice' or 'ref_audio' may be provided, not both")
 
-        resolved_model = model if is_given(model) else DEFAULT_MODEL
-        resolved_voice = (
-            voice if is_given(voice) else (None if is_given(ref_audio) else DEFAULT_VOICE)
-        )
-        resolved_ref_audio = ref_audio if is_given(ref_audio) else None
-        resolved_response_format = (
-            response_format if is_given(response_format) else DEFAULT_RESPONSE_FORMAT
-        )
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
             sample_rate=SAMPLE_RATE,
             num_channels=NUM_CHANNELS,
         )
         self._opts = _TTSOptions(
-            model=resolved_model,
-            voice=resolved_voice,
-            ref_audio=resolved_ref_audio,
-            response_format=resolved_response_format,
+            model=model if is_given(model) else DEFAULT_MODEL,
+            voice=voice if is_given(voice) else (None if is_given(ref_audio) else DEFAULT_VOICE),
+            ref_audio=ref_audio if is_given(ref_audio) else None,
+            response_format=response_format
+            if is_given(response_format)
+            else DEFAULT_RESPONSE_FORMAT,
         )
 
         mistral_api_key = api_key if is_given(api_key) else os.environ.get("MISTRAL_API_KEY")
@@ -120,7 +115,7 @@ class TTS(tts.TTS):
             model: The model to use for text-to-speech. Clears ``ref_audio``.
             voice: The voice ID to use for synthesis.
             ref_audio: Base64-encoded audio sample for zero-shot voice cloning. Clears ``voice``.
-            response_format: The audio format of synthesized speech, between ``mp3``, ``wav``, ``pcm``, ``opus`` or ``flac``. Defaults to ``pcm``.
+            response_format: The audio format of synthesized speech, between ``mp3``, ``wav``, ``pcm``, ``opus`` or ``flac``. Defaults to ``mp3``.
         """
         if is_given(voice) and is_given(ref_audio):
             raise ValueError("Only one of 'voice' or 'ref_audio' may be provided, not both")
@@ -190,9 +185,14 @@ class ChunkedStream(tts.ChunkedStream):
 
             output_emitter.flush()
 
-        except httpx.TimeoutException as e:
+        except (asyncio.TimeoutError, httpx.TimeoutException) as e:
             raise APITimeoutError() from e
-        except SDKError as e:
-            raise APIStatusError(e.message, status_code=e.status_code, body=e.body) from e
+        except (SDKError, HTTPValidationError) as e:
+            raise APIStatusError(
+                e.message,
+                status_code=e.status_code,
+                request_id=e.headers.get("x-request-id"),
+                body=e.body,
+            ) from e
         except Exception as e:
             raise APIConnectionError() from e

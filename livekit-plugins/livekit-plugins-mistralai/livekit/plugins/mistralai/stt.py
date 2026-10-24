@@ -5,6 +5,8 @@ import os
 import weakref
 from dataclasses import dataclass
 
+import httpx  # mistralai raises httpx.TimeoutException from its httpx v1 client
+
 from livekit import rtc
 from livekit.agents import (
     APIConnectionError,
@@ -24,7 +26,7 @@ from livekit.agents.types import (
 from livekit.agents.utils import AudioBuffer, is_given
 from livekit.agents.voice.io import TimedString
 from mistralai.client import Mistral
-from mistralai.client.errors import SDKError
+from mistralai.client.errors import HTTPValidationError, SDKError
 from mistralai.client.models import (
     RealtimeTranscriptionError,
     RealtimeTranscriptionSessionCreated,
@@ -83,11 +85,6 @@ class STT(stt.STT):
                 When not provided, Silero VAD is auto-loaded with default settings. Only used with realtime models.
         """
         resolved_model = model if is_given(model) else DEFAULT_MODEL
-        resolved_language = LanguageCode(language) if is_given(language) else None
-        resolved_context_bias = context_bias if is_given(context_bias) else None
-        resolved_target_streaming_delay_ms = (
-            target_streaming_delay_ms if is_given(target_streaming_delay_ms) else None
-        )
         is_realtime = _is_realtime(resolved_model)
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -99,9 +96,11 @@ class STT(stt.STT):
         )
         self._opts = _STTOptions(
             model=resolved_model,
-            language=resolved_language,
-            context_bias=resolved_context_bias,
-            target_streaming_delay_ms=resolved_target_streaming_delay_ms,
+            language=LanguageCode(language) if is_given(language) else None,
+            context_bias=context_bias if is_given(context_bias) else None,
+            target_streaming_delay_ms=target_streaming_delay_ms
+            if is_given(target_streaming_delay_ms)
+            else None,
         )
 
         if is_realtime and vad is None:
@@ -127,10 +126,18 @@ class STT(stt.STT):
 
     async def _connect_ws(self, timeout: float) -> RealtimeConnection:
         rt = RealtimeTranscription(self._client.sdk_configuration)
+        http_headers = None
+        cfg = self._client.sdk_configuration
+        client_headers = getattr(cfg.async_client, "headers", None) or getattr(
+            cfg.client, "headers", None
+        )
+        if client_headers:
+            http_headers = dict(client_headers)
         return await asyncio.wait_for(
             rt.connect(
                 model=self._opts.model,
                 target_streaming_delay_ms=self._opts.target_streaming_delay_ms,
+                http_headers=http_headers,
             ),
             timeout=timeout,
         )
@@ -227,10 +234,15 @@ class STT(stt.STT):
                 ],
             )
 
-        except SDKError as e:
-            if e.status_code in (408, 504):
-                raise APITimeoutError() from e
-            raise APIStatusError(e.message, status_code=e.status_code, body=e.body) from e
+        except (asyncio.TimeoutError, httpx.TimeoutException) as e:
+            raise APITimeoutError() from e
+        except (SDKError, HTTPValidationError) as e:
+            raise APIStatusError(
+                e.message,
+                status_code=e.status_code,
+                request_id=e.headers.get("x-request-id"),
+                body=e.body,
+            ) from e
         except Exception as e:
             raise APIConnectionError() from e
 
@@ -444,9 +456,14 @@ class SpeechStream(stt.RecognizeStream):
 
         except (APIStatusError, APITimeoutError, APIConnectionError):
             raise
-        except SDKError as e:
-            if e.status_code in (408, 504):
-                raise APITimeoutError() from e
-            raise APIStatusError(e.message, status_code=e.status_code, body=e.body) from e
+        except (asyncio.TimeoutError, httpx.TimeoutException) as e:
+            raise APITimeoutError() from e
+        except (SDKError, HTTPValidationError) as e:
+            raise APIStatusError(
+                e.message,
+                status_code=e.status_code,
+                request_id=e.headers.get("x-request-id"),
+                body=e.body,
+            ) from e
         except Exception as e:
             raise APIConnectionError() from e
